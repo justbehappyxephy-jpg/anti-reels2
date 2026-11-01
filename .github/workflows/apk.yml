@@ -1,0 +1,383 @@
+name: Fabriquer l'APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Ecrire les fichiers du projet
+        run: |
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'ENDOFFILE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+              plugins {
+                  id("com.android.application") version "8.5.2"
+                  id("org.jetbrains.kotlin.android") version "1.9.24"
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "AntiReels"
+          include(":app")
+          ENDOFFILE
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'ENDOFFILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.antireels"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.antireels"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          ENDOFFILE
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'ENDOFFILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Anti-Réels"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".ReelBlockerService"
+                      android:exported="true"
+                      android:label="Anti-Réels"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          ENDOFFILE
+          mkdir -p "$(dirname 'app/src/main/res/xml/accessibility_config.xml')"
+          cat > 'app/src/main/res/xml/accessibility_config.xml' <<'ENDOFFILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewScrolled"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="250"
+              android:packageNames="com.instagram.android,com.google.android.youtube,com.zhiliaoapp.musically,com.ss.android.ugc.trill" />
+          ENDOFFILE
+          mkdir -p "$(dirname 'app/src/main/java/com/antireels/ReelBlockerService.kt')"
+          cat > 'app/src/main/java/com/antireels/ReelBlockerService.kt' <<'ENDOFFILE'
+          package com.antireels
+
+          import android.accessibilityservice.AccessibilityService
+          import android.graphics.Rect
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.widget.Toast
+
+          class ReelBlockerService : AccessibilityService() {
+
+              private enum class Region { TOP, BOTTOM }
+
+              private class AppConf(
+                  val key: String,
+                  val viewerIds: List<String>,
+                  val tabIds: List<String>,
+                  val tabLabels: List<String>,
+                  val region: Region
+              )
+
+              private val instagram = AppConf(
+                  key = "instagram",
+                  viewerIds = listOf(
+                      "com.instagram.android:id/clips_viewer_view_pager",
+                      "com.instagram.android:id/clips_viewer_video_layout"
+                  ),
+                  tabIds = listOf("com.instagram.android:id/clips_tab"),
+                  tabLabels = listOf("Reels"),
+                  region = Region.BOTTOM
+              )
+
+              private val youtube = AppConf(
+                  key = "youtube",
+                  viewerIds = listOf(
+                      "com.google.android.youtube:id/reel_recycler",
+                      "com.google.android.youtube:id/reel_player_page_container"
+                  ),
+                  tabIds = emptyList(),
+                  tabLabels = listOf("Shorts"),
+                  region = Region.BOTTOM
+              )
+
+              private val tiktok = AppConf(
+                  key = "tiktok",
+                  viewerIds = emptyList(),
+                  tabIds = emptyList(),
+                  tabLabels = listOf("Pour toi", "For You"),
+                  region = Region.TOP
+              )
+
+              private val apps: Map<String, AppConf> = mapOf(
+                  "com.instagram.android" to instagram,
+                  "com.google.android.youtube" to youtube,
+                  "com.zhiliaoapp.musically" to tiktok,
+                  "com.ss.android.ugc.trill" to tiktok
+              )
+
+              private val allowed = HashSet<String>()
+              private var lastBlock = 0L
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  if (event == null) return
+                  val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+                  if (!prefs.getBoolean("enabled", true)) return
+
+                  val pkg = event.packageName?.toString() ?: return
+                  val conf = apps[pkg] ?: return
+                  if (!prefs.getBoolean("app_" + conf.key, true)) return
+
+                  val root = rootInActiveWindow ?: return
+                  if (root.packageName?.toString() != pkg) return
+
+                  if (isFeedTabSelected(root, conf)) {
+                      allowed.remove(pkg)
+                      block()
+                      return
+                  }
+
+                  val inViewer = conf.viewerIds.any { !root.findAccessibilityNodeInfosByViewId(it).isNullOrEmpty() }
+                  if (!inViewer) {
+                      allowed.remove(pkg)
+                      return
+                  }
+
+                  if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED && allowed.contains(pkg)) {
+                      val sourceId = event.source?.viewIdResourceName
+                      if (sourceId != null && conf.viewerIds.contains(sourceId)) {
+                          allowed.remove(pkg)
+                          block()
+                          return
+                      }
+                  }
+                  allowed.add(pkg)
+              }
+
+              private fun isFeedTabSelected(root: AccessibilityNodeInfo, conf: AppConf): Boolean {
+                  for (id in conf.tabIds) {
+                      val nodes = root.findAccessibilityNodeInfosByViewId(id)
+                      if (!nodes.isNullOrEmpty()) {
+                          return nodes.any { isSelectedOrParent(it) }
+                      }
+                  }
+                  val height = resources.displayMetrics.heightPixels
+                  for (label in conf.tabLabels) {
+                      val nodes = root.findAccessibilityNodeInfosByText(label) ?: continue
+                      for (node in nodes) {
+                          val r = Rect()
+                          node.getBoundsInScreen(r)
+                          val inZone = if (conf.region == Region.BOTTOM) {
+                              r.top >= height * 0.85
+                          } else {
+                              r.bottom <= height * 0.20
+                          }
+                          if (inZone && isSelectedOrParent(node)) return true
+                      }
+                  }
+                  return false
+              }
+
+              private fun isSelectedOrParent(node: AccessibilityNodeInfo): Boolean {
+                  var cur: AccessibilityNodeInfo? = node
+                  var depth = 0
+                  while (cur != null && depth < 3) {
+                      if (cur.isSelected) return true
+                      cur = cur.parent
+                      depth++
+                  }
+                  return false
+              }
+
+              private fun block() {
+                  val now = System.currentTimeMillis()
+                  if (now - lastBlock < 1500) return
+                  lastBlock = now
+                  performGlobalAction(GLOBAL_ACTION_BACK)
+                  Toast.makeText(this, "Fil de vidéos bloqué", Toast.LENGTH_SHORT).show()
+              }
+
+              override fun onInterrupt() {}
+
+              companion object {
+                  const val PREFS = "anti_reels"
+              }
+          }
+          ENDOFFILE
+          mkdir -p "$(dirname 'app/src/main/java/com/antireels/MainActivity.kt')"
+          cat > 'app/src/main/java/com/antireels/MainActivity.kt' <<'ENDOFFILE'
+          package com.antireels
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Switch
+          import android.widget.TextView
+
+          private const val HELP =
+              "Comment ça marche\n\n" +
+              "Sur Instagram (onglet Reels), YouTube (onglet Shorts) et TikTok (Pour toi), " +
+              "l'appli te ramène en arrière dès qu'un fil infini s'ouvre.\n\n" +
+              "Une vidéo ouverte depuis une conversation, un lien, une notification ou un profil reste visible. " +
+              "Mais si tu fais défiler vers la suivante, c'est bloqué.\n\n" +
+              "Si l'interrupteur d'accessibilité est grisé : Réglages > Applis > Anti-Réels > menu ⋮ > " +
+              "Autoriser les paramètres restreints.\n\n" +
+              "Si Instagram, YouTube ou TikTok changent leur interface, le blocage peut cesser de fonctionner."
+
+          class MainActivity : Activity() {
+
+              private lateinit var status: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences(ReelBlockerService.PREFS, MODE_PRIVATE)
+                  val pad = (20 * resources.displayMetrics.density).toInt()
+
+                  val col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(pad, pad * 2, pad, pad)
+
+                  fun label(t: String, size: Float, bold: Boolean): TextView {
+                      val v = TextView(this)
+                      v.text = t
+                      v.textSize = size
+                      if (bold) v.setTypeface(null, Typeface.BOLD)
+                      v.setPadding(0, 0, 0, pad / 2)
+                      return v
+                  }
+
+                  fun toggle(t: String, key: String): Switch {
+                      val s = Switch(this)
+                      s.text = t
+                      s.textSize = 16f
+                      s.isChecked = prefs.getBoolean(key, true)
+                      s.setPadding(0, pad / 2, 0, pad / 2)
+                      s.setOnCheckedChangeListener { _, checked ->
+                          prefs.edit().putBoolean(key, checked).apply()
+                      }
+                      return s
+                  }
+
+                  col.addView(label("Anti-Réels", 26f, true))
+                  status = label("", 16f, true)
+                  col.addView(status)
+
+                  val open = Button(this)
+                  open.text = "Ouvrir les réglages d'accessibilité"
+                  open.setOnClickListener {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+                  col.addView(open)
+
+                  col.addView(label("", 8f, false))
+                  col.addView(toggle("Blocage activé", "enabled"))
+                  col.addView(toggle("Instagram (Reels)", "app_instagram"))
+                  col.addView(toggle("YouTube (Shorts)", "app_youtube"))
+                  col.addView(toggle("TikTok (Pour toi)", "app_tiktok"))
+                  col.addView(label("", 8f, false))
+                  col.addView(label(HELP, 14f, false))
+
+                  val scroll = ScrollView(this)
+                  scroll.addView(col)
+                  setContentView(scroll)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  status.text = if (serviceEnabled()) {
+                      "✅ Le service est activé"
+                  } else {
+                      "⚠️ Service désactivé : active « Anti-Réels » dans les réglages d'accessibilité"
+                  }
+              }
+
+              private fun serviceEnabled(): Boolean {
+                  val enabled = Settings.Secure.getString(
+                      contentResolver,
+                      Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                  ) ?: return false
+                  return enabled.contains("$packageName/")
+              }
+          }
+          ENDOFFILE
+
+      - name: Fabriquer l'APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Publier l'APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk AntiReels.apk
+          gh release create "v${{ github.run_number }}" AntiReels.apk --title "Anti-Reels v${{ github.run_number }}" --notes "APK a installer sur Android"
